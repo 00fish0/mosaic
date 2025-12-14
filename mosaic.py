@@ -339,7 +339,7 @@ class OperatingSystem:
                     'name': th.context.gi_frame.f_code.co_name,
                     'heap': heaps[id(th.heap)],  # the unique heap id
                     'pc': th.context.gi_frame.f_lineno,
-                    'locals': th.context.gi_frame.f_locals,
+                    'locals': th.context.gi_frame.f_locals.copy(),
                 } if th.context.gi_frame is not None else None
                     for th in self._threads
             ],
