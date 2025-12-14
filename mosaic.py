@@ -33,7 +33,13 @@ sys_bwrite = lambda k, v: os.sys_bwrite(k, v)
 sys_sync = lambda: os.sys_sync()
 sys_crash = lambda: os.sys_crash()
 
-### 1.4 System call helpers
+### 1.4 Synchronization primitives
+
+sys_sem_init = lambda k, v: os.sys_sem_init(k, v)
+sys_P = lambda k: os.sys_P(k)
+sys_V = lambda k: os.sys_V(k)
+
+### 1.5 System call helpers
 
 SYSCALLS = []
 
@@ -56,6 +62,7 @@ class Heap:
 class Thread:
     context: Generator  # program counter, local variables, etc.
     heap: Heap  # a pointer to thread's "memory"
+    status: str = "runnable"  # 'runnable' or 'blocked'
 
 
 @dataclass
@@ -179,6 +186,7 @@ class OperatingSystem:
         self._choices = {init.__name__: lambda: None}
         self._stdout = ""
         self._storage = Storage(persist={}, buf={})
+        self._semaphores = {}
 
         # Internal states
         self._init = init
@@ -239,7 +247,8 @@ class OperatingSystem:
         return {
             f"t{i+1}": (lambda i=i: self._switch_to(i))
             for i, th in enumerate(self._threads)
-            if th.context.gi_frame is not None  # thread still alive?
+            if th.context.gi_frame is not None
+            and th.status == "runnable"  # thread still alive and runnable?
         }
 
     ### 2.3.2 Virtual character device (byte stream)
@@ -316,6 +325,45 @@ class OperatingSystem:
         )
         return dict(enumerate(crash_sites))
 
+    ### 2.3.4 Synchronization primitives
+
+    @syscall
+    def sys_sem_init(self, name, value):
+        """Initialize a semaphore with the given value."""
+
+        def do_sem_init():
+            self._semaphores[name] = {"value": value, "waiting": []}
+
+        return {"sem_init": (lambda: do_sem_init())}
+
+    @syscall
+    def sys_P(self, name):
+        """Wait (P) on a semaphore."""
+
+        def do_P():
+            sem = self._semaphores[name]
+            if sem["value"] > 0:
+                sem["value"] -= 1
+            else:
+                sem["waiting"].append(self._current)
+                self.current().status = "blocked"
+
+        return {"P": (lambda: do_P())}
+
+    @syscall
+    def sys_V(self, name):
+        """Signal (V) on a semaphore."""
+
+        def do_V():
+            sem = self._semaphores[name]
+            if sem["waiting"]:
+                tid = sem["waiting"].pop(0)
+                self._threads[tid].status = "runnable"
+            else:
+                sem["value"] += 1
+
+        return {"V": (lambda: do_V())}
+
     ### 2.4 Operating system as a state machine
 
     def replay(self, trace: list) -> dict:
@@ -330,12 +378,15 @@ class OperatingSystem:
         action = self._choices[choice]  # return value of sys_xxx: a lambda
         res = action()
 
-        try:  # Execute current thread for one step
-            func, args = self.current().context.send(res)
-            assert func in SYSCALLS
-            self._choices = getattr(self, func)(*args)
-        except StopIteration:  # ... and thread terminates
+        if self.current().status == "blocked":
             self._choices = self.sys_sched()
+        else:
+            try:  # Execute current thread for one step
+                func, args = self.current().context.send(res)
+                assert func in SYSCALLS
+                self._choices = getattr(self, func)(*args)
+            except StopIteration:  # ... and thread terminates
+                self._choices = self.sys_sched()
 
         # At this point, the operating system's state is
         #   (self._threads, self._current, self._stdout, self._storage)
@@ -360,6 +411,7 @@ class OperatingSystem:
                         "heap": heaps[id(th.heap)],  # the unique heap id
                         "pc": th.context.gi_frame.f_lineno,
                         "locals": th.context.gi_frame.f_locals.copy(),
+                        "status": th.status,
                     }
                     if th.context.gi_frame is not None
                     else None
@@ -368,6 +420,7 @@ class OperatingSystem:
             ],
             "heaps": {heaps[id(th.heap)]: th.heap.__dict__ for th in self._threads},
             "stdout": self._stdout,
+            "semaphores": self._semaphores,
             "store_persist": self._storage.persist,
             "store_buffer": self._storage.buf,
         }
