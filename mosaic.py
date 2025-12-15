@@ -62,7 +62,9 @@ class Heap:
 class Thread:
     context: Generator  # program counter, local variables, etc.
     heap: Heap  # a pointer to thread's "memory"
-    status: str = "runnable"  # 'runnable' or 'blocked'
+    status: str = "runnable"  # 'runnable', 'blocked', or 'waking'
+    # 'waking' means the thread was blocked but just got woken up by V,
+    # it needs to resume execution when scheduled
 
 
 @dataclass
@@ -248,7 +250,8 @@ class OperatingSystem:
             f"t{i+1}": (lambda i=i: self._switch_to(i))
             for i, th in enumerate(self._threads)
             if th.context.gi_frame is not None
-            and th.status == "runnable"  # thread still alive and runnable?
+            and th.status
+            in ("runnable", "waking")  # thread still alive and schedulable?
         }
 
     ### 2.3.2 Virtual character device (byte stream)
@@ -353,16 +356,31 @@ class OperatingSystem:
     @syscall
     def sys_V(self, name):
         """Signal (V) on a semaphore."""
+        sem = self._semaphores[name]
 
-        def do_V():
-            sem = self._semaphores[name]
-            if sem["waiting"]:
-                tid = sem["waiting"].pop(0)
-                self._threads[tid].status = "runnable"
-            else:
+        if sem["waiting"]:
+            # There's a thread waiting - wake it up and offer scheduling choices
+            tid = sem["waiting"].pop(0)
+            self._threads[tid].status = "waking"
+
+            # Return scheduling choices: continue current thread or switch to others
+            # This is the key: V operation should trigger a scheduling decision
+            def do_V_continue():
+                pass  # V already done above, just continue
+
+            choices = {
+                f"V->t{i+1}": (lambda i=i: self._switch_to(i))
+                for i, th in enumerate(self._threads)
+                if th.context.gi_frame is not None
+                and th.status in ("runnable", "waking")
+            }
+            return choices
+        else:
+            # No thread waiting - just increment and continue
+            def do_V():
                 sem["value"] += 1
 
-        return {"V": (lambda: do_V())}
+            return {"V": (lambda: do_V())}
 
     ### 2.4 Operating system as a state machine
 
@@ -379,7 +397,17 @@ class OperatingSystem:
         res = action()
 
         if self.current().status == "blocked":
+            # Thread just got blocked by P, need to schedule another thread
             self._choices = self.sys_sched()
+        elif self.current().status == "waking":
+            # Thread was woken up from P block, resume its execution
+            self.current().status = "runnable"
+            try:
+                func, args = self.current().context.send(None)  # P returns None
+                assert func in SYSCALLS
+                self._choices = getattr(self, func)(*args)
+            except StopIteration:
+                self._choices = self.sys_sched()
         else:
             try:  # Execute current thread for one step
                 func, args = self.current().context.send(res)
